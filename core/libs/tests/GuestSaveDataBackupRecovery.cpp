@@ -14,6 +14,7 @@
 #include <source_location>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 #ifdef _WIN32
 #include <process.h>
@@ -37,6 +38,8 @@ const char* stopStep = nullptr;
 int stopCall = 1;
 int calls = 0;
 bool failStep = false;
+bool obstructStep = false;
+int planted = 0;
 int rollbackCall = 0;
 int rollbackCalls = 0;
 
@@ -77,22 +80,28 @@ SceSaveDataDirName Name() {
     return name;
 }
 
-bool Step(const char* step, const char*) {
+bool Step(const char* step, const char* path) {
     if (rollbackCall != 0 && std::strcmp(step, "backup.rollback") == 0 && ++rollbackCalls == rollbackCall) return false;
     if (stopStep == nullptr || std::strcmp(stopStep, step) != 0 || ++calls != stopCall) return true;
     if (failStep) return false;
+    if (obstructStep) {
+        Write(path, "obstacle");
+        ++planted;
+        return true;
+    }
     std::_Exit(Interrupted);
 }
 
-void SetStep(const char* step, bool fail = false, int call = 1) {
+void SetStep(const char* step, bool fail = false, int call = 1, bool obstruct = false) {
     stopStep = step;
     stopCall = call;
     calls = 0;
     failStep = fail;
+    obstructStep = obstruct;
     SaveDataSetFileStepHook_nid_no_patch(Step);
 }
 
-void BackUp(const char* version, bool expectRenameFailure = false) {
+void BackUp(const char* version, bool expectFailure = false) {
     auto name = Name();
     SaveDataMount3 request{};
     request.user_id = 7;
@@ -109,9 +118,10 @@ void BackUp(const char* version, bool expectRenameFailure = false) {
     SaveDataEvent event{};
     Require(sceSaveDataGetEventResult(nullptr, &event) == 0);
     Require(event.type == 1 && event.user_id == 7 && std::strcmp(event.dir_name.data, "kept") == 0);
-    const bool failed = expectRenameFailure || (failStep && std::strcmp(stopStep, "backup.cleanup") != 0);
+    const bool failed = expectFailure || (failStep && std::strcmp(stopStep, "backup.cleanup") != 0);
     Require(event.error_code == (failed ? Internal : 0));
     if (failStep) Require(calls != 0);
+    if (obstructStep) Require(planted == 1);
 }
 
 void CheckBackup(const char* expected) {
@@ -138,7 +148,7 @@ int Child(int argc, char** argv) {
     Require(sceSaveDataInitialize3(nullptr) == 0);
     const std::string operation = argv[2];
     if (argc > 7) rollbackCall = std::stoi(argv[7]);
-    if (argc > 4) SetStep(argv[4], argc > 5 && std::strcmp(argv[5], "fail") == 0, argc > 6 ? std::stoi(argv[6]) : 1);
+    if (argc > 4) SetStep(argv[4], argc > 5 && std::strcmp(argv[5], "fail") == 0, argc > 6 ? std::stoi(argv[6]) : 1, argc > 5 && std::strcmp(argv[5], "obstruct") == 0);
     if (operation == "backup") {
         BackUp(argv[3]);
     } else if (operation == "check") {
@@ -154,8 +164,14 @@ int Child(int argc, char** argv) {
         SaveDataDelete request{};
         request.dir_name = &name;
         Require(sceSaveDataDelete(&request) == (std::strcmp(argv[3], "invalid") == 0 ? Internal : 0));
-    } else if (operation == "backup-locked") {
+    } else if (operation == "backup-locked" || operation == "backup-obstructed") {
         BackUp(argv[3], true);
+    } else if (operation == "restore-obstructed") {
+        auto name = Name();
+        SaveDataRestoreBackupData request{};
+        request.dir_name = &name;
+        Require(sceSaveDataRestoreBackupData(&request) == Internal);
+        Require(planted == 1);
     } else {
         throw std::runtime_error("unknown child operation");
     }
@@ -471,6 +487,27 @@ void Unpublished(const std::filesystem::path& executable) {
     Require(Run(executable, {"check", "new"}) == 0);
 }
 
+void Obstructed(const std::filesystem::path& executable) {
+    for (const char* call : {"1", "2", "3", "4"}) {
+        const auto original = Start(executable);
+        Require(Run(executable, {"backup-obstructed", "new", "backup.copy", "obstruct", call}) == 0);
+        Require(Tree(Backup) == original);
+        NoCopies();
+        Require(Run(executable, {"check", "old"}) == 0);
+    }
+    for (const auto& [step, call] : {std::pair{"restore.copy", "1"}, std::pair{"restore.copy", "2"}, std::pair{"restore.copy", "3"}, std::pair{"restore.copy", "4"}, std::pair{"restore.aside", "1"}}) {
+        const auto original = Start(executable);
+        Write("_sd/kept/live-only", "not in the backup");
+        const auto live = Tree("_sd/kept");
+        const auto param = Read("_sd/kept.param");
+        const auto blocks = Read("_sd/kept.blocks");
+        Require(Run(executable, {"restore-obstructed", "old", step, "obstruct", call}) == 0);
+        Require(Tree("_sd/kept") == live && Read("_sd/kept.param") == param && Read("_sd/kept.blocks") == blocks);
+        Require(Tree(Backup) == original);
+        Require(!std::filesystem::exists("_sd_restore_tmp/kept") && !std::filesystem::exists("_sd_restore_old/kept"));
+    }
+}
+
 bool Links(const std::filesystem::path& executable) {
     const auto original = Start(executable);
     Require(Run(executable, {"backup", "new", "backup.place"}) == Interrupted);
@@ -526,6 +563,7 @@ int main(int argc, char** argv) {
         else if (operation == "invalid") Invalid(executable);
         else if (operation == "published") Published(executable);
         else if (operation == "unpublished") Unpublished(executable);
+        else if (operation == "obstructed") Obstructed(executable);
         else if (operation == "links") result = Links(executable) ? 0 : 77;
         else throw std::runtime_error("unknown backup recovery operation");
         std::filesystem::current_path(previous);
